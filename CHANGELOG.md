@@ -5,6 +5,28 @@ All notable changes to this project are documented here.
 This project uses [Semantic Versioning](https://semver.org/). While on `0.x`, the config
 format and CLI surface may change between minor versions.
 
+## [0.1.1] — 2026-09-06
+
+### Fixed
+
+- **Mode 2 discovery never reached the model.** `tools/list` returned a fixed pair of
+  tools, so a tool found by `request_tools` was marked callable but its schema was never
+  advertised — the client had no function definition to give the model, and the "they have
+  been seamlessly added to your environment" acknowledgement was simply false
+  ([#5](https://github.com/igiamronit/justbetter-mcp/issues/5)). Now:
+  - `tools/list` returns the discovery primitives, the pinned tools, and everything
+    `request_tools` has found this session, capped at 24 discovered tools and evicted
+    oldest-first so the surface cannot grow back into the inject-all baseline.
+  - The server declares `capabilities.tools.listChanged` and emits
+    `notifications/tools/list_changed` when the advertised set grows.
+  - `request_tools` returns the matched tools' real JSON schemas in its result, and
+    `batch_call` accepts any of those names — so a discovered tool is callable in the same
+    turn even in clients that only refresh their tool list on restart.
+- **Pinned tools were unreachable over stdio.** `pinnedTools` were re-injected on every
+  Mode 1 request but never advertised in Mode 2, so a Claude Desktop session started with
+  no file or terminal access until the model guessed that `request_tools` existed. They
+  are now advertised once upstream indexing completes.
+
 ## [0.1.0] — 2026-09-05
 
 First public release.
@@ -63,4 +85,5 @@ Two modes:
 - `searchTools` is a full scan — fine at current catalog sizes.
 - The Mode 1 output-quality advantage is a hypothesis, not a measured result.
 
+[0.1.1]: https://github.com/igiamronit/justbetter-mcp/releases/tag/v0.1.1
 [0.1.0]: https://github.com/igiamronit/justbetter-mcp/releases/tag/v0.1.0

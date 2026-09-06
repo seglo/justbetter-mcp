@@ -747,6 +747,111 @@ const tests: TestCase[] = [
     }
   },
   {
+    name: 'advertised: the Mode 2 surface starts empty, grows by discovery, and stays bounded',
+    async fn() {
+      const {
+        advertiseTools, advertisedSchemas, advertisedCount, isToolAdvertised,
+        clearAdvertised, ADVERTISED_LIMIT
+      } = await import(srcModule('src/advertised.ts'));
+
+      const indexed = (name: string) => ({
+        id: `srv:${name}`,
+        server_name: 'srv',
+        tool_name: name,
+        description: `does ${name}`,
+        full_schema_json: JSON.stringify({
+          name,
+          description: `does ${name}`,
+          inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
+        }),
+        fingerprint: `fp-${name}`
+      });
+
+      clearAdvertised();
+      assert.equal(advertisedCount(), 0, 'nothing is advertised until something is discovered');
+
+      advertiseTools([indexed('write_file')], { sticky: true });
+      const added = advertiseTools([indexed('search_repositories'), indexed('create_issue')]);
+      assert.deepEqual(added, ['search_repositories', 'create_issue']);
+
+      // Re-requesting an already-advertised tool is not a new advertisement, so the
+      // caller can skip a tools/list_changed that would tell the client nothing.
+      assert.deepEqual(advertiseTools([indexed('create_issue')]), []);
+
+      // The schema handed to the client has to be the real one, not a name in prose.
+      const issue = advertisedSchemas().find((t: any) => t.name === 'create_issue');
+      assert.deepEqual(issue?.inputSchema,
+        { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] });
+
+      // Pinned tools lead, so the front of the list does not reshuffle on every discovery.
+      assert.equal(advertisedSchemas()[0]?.name, 'write_file');
+
+      assert.equal(isToolAdvertised('create_issue'), true);
+      assert.equal(isToolAdvertised('never_found'), false);
+
+      // An advertised set that only grows converges on the full catalog, which is the
+      // dump-everything baseline this whole design exists to avoid.
+      for (let i = 0; i < ADVERTISED_LIMIT + 10; i++) {
+        advertiseTools([indexed(`filler_${i}`)]);
+      }
+      assert.ok(advertisedCount() <= ADVERTISED_LIMIT,
+        `advertised surface must stay bounded, got ${advertisedCount()}`);
+      assert.equal(isToolAdvertised('write_file'), true, 'pinned tools are never evicted');
+      assert.equal(isToolAdvertised('search_repositories'), false, 'oldest discovery is evicted first');
+
+      clearAdvertised();
+    }
+  },
+  {
+    name: 'hallucination gate: a tool advertised over stdio is callable without a fresh injection',
+    async fn() {
+      const { default: Database } = await import('better-sqlite3');
+      const { activeUpstreams } = await import(srcModule('src/upstream.ts'));
+      const { validateToolCall } = await import(srcModule('src/gates/hallucination.ts'));
+      const { advertiseTools, clearAdvertised } = await import(srcModule('src/advertised.ts'));
+      const { CATALOG_DB_PATH } = await import(srcModule('src/paths.ts'));
+
+      activeUpstreams.length = 0;
+      activeUpstreams.push({
+        name: 'fs',
+        client: {} as any,
+        tools: [{ name: 'advertised_read', description: 'Read file', inputSchema: { type: 'object' } } as any]
+      });
+
+      const schema = JSON.stringify({
+        name: 'advertised_read',
+        description: 'Read file',
+        inputSchema: { type: 'object', properties: {} }
+      });
+      const db = new Database(CATALOG_DB_PATH());
+      db.prepare(`
+        INSERT OR REPLACE INTO tools (id, server_name, tool_name, description, full_schema_json, fingerprint, approved_fingerprint, is_quarantined)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run('fs:advertised_read', 'fs', 'advertised_read', 'Read file', schema, 'fp-adv', 'fp-adv', 0);
+      db.close();
+
+      clearAdvertised();
+      const config = { pinnedTools: [], destructiveTools: [] };
+      assert.equal(validateToolCall('advertised_read', {}, config).allowed, false);
+
+      // Over stdio the advertised set is our own answer to tools/list, so it is a fact
+      // about what the client holds -- not the timed guess Mode 1 has to make.
+      advertiseTools([{
+        id: 'fs:advertised_read',
+        server_name: 'fs',
+        tool_name: 'advertised_read',
+        description: 'Read file',
+        full_schema_json: schema,
+        fingerprint: 'fp-adv'
+      }]);
+      assert.equal(validateToolCall('advertised_read', {}, config).allowed, true);
+
+      clearAdvertised();
+      assert.equal(validateToolCall('advertised_read', {}, config).allowed, false,
+        'an evicted tool loses its authority with it');
+    }
+  },
+  {
     name: 'embeddings: the model cache lives in the state directory, not node_modules',
     async fn() {
       const { env } = await import('@huggingface/transformers');

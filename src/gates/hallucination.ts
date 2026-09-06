@@ -3,6 +3,7 @@ import { getToolByName, isToolInjected } from '../catalog.js';
 import type { IndexedTool } from '../catalog.js';
 import { activeUpstreams } from '../upstream.js';
 import { passesPreconditions } from './precondition.js';
+import { isToolAdvertised } from '../advertised.js';
 
 const Ajv = _Ajv as any;
 const ajv = new Ajv({ strict: false });
@@ -41,10 +42,14 @@ export function validateToolCall(toolName: string, args: any, config: any = {}):
 
   // 1. Hallucination Gate
   // Pinned tools are, by definition, always part of the environment: Mode 1 re-injects
-  // them on every request, and Mode 2 advertises them through request_tools. Gating them
-  // on a per-turn injection record would make them permanently uncallable over stdio.
+  // them on every request, and Mode 2 advertises them in tools/list. Gating them on a
+  // per-turn injection record would make them permanently uncallable over stdio.
   const isPinned = pinnedTools.includes(toolName);
-  if (!isPinned && !isToolInjected(toolName)) {
+  // Over stdio we know precisely what the client is holding, because tools/list is our
+  // own answer. An advertised tool therefore needs no injection record: the time-boxed
+  // window exists for Mode 1, where the gateway can only guess what survived in context.
+  const isAdvertised = isToolAdvertised(toolName);
+  if (!isPinned && !isAdvertised && !isToolInjected(toolName)) {
     console.error(`[Hallucination Gate] BLOCKED: LLM hallucinated call to non-injected tool: ${toolName}`);
 
     if (cfg.injectAllTools) {

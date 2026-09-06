@@ -48,8 +48,9 @@ read and write. There is no JSON to hand-author.
 }
 ```
 
-The client will see exactly two tools, `request_tools` and `batch_call`. Everything else is
-retrieved on demand — that is the whole point.
+The client starts with `request_tools`, `batch_call` and your pinned tools. Everything else is
+retrieved on demand: when `request_tools` finds something, its schema is added to the server's
+tool list and the client is notified — that is the whole point.
 
 > **Mode 1 needs a client that lets you set an OpenAI-compatible base URL.** The bundled TUI is
 > the reference client and always works. Cline, Roo, Continue, aider and Zed accept a custom base
@@ -131,7 +132,9 @@ sequenceDiagram
 
 This mode is used natively by third-party clients like Claude Desktop and Cursor, and can be enabled in the JustBetter CLI by setting `"semanticPromptInjection": false`.
 
-In this mode, the gateway employs a reactive approach. It hides the massive catalog of upstream tools to prevent token bloat and exposes only a single `request_tools` primitive. The AI explicitly asks the Gateway for tools mid-conversation when needed. This mirrors the behavior of Anthropic's MCP Tool Search and OpenAI Codex's tool search, trading one extra round-trip for massive context savings.
+In this mode, the gateway employs a reactive approach. It hides the massive catalog of upstream tools to prevent token bloat and advertises only the `request_tools` and `batch_call` primitives plus your pinned tools. The AI explicitly asks the Gateway for tools mid-conversation when needed; the matched schemas are returned in the response *and* added to the gateway's `tools/list`, which is re-announced with a `notifications/tools/list_changed`. This mirrors the behavior of Anthropic's MCP Tool Search and OpenAI Codex's tool search, trading one extra round-trip for massive context savings.
+
+The advertised set is capped (24 discovered tools) and evicted oldest-first, so a long session cannot quietly grow back into the dump-everything baseline. Clients vary in how they react to `tools/list_changed` — some re-read immediately, some only on restart — so the discovered schemas also come back in the `request_tools` result, and `batch_call` accepts any of those names. A discovered tool is therefore callable in the same turn regardless of what the client does with the notification.
 
 #### Flowchart Style
 ```mermaid
@@ -143,7 +146,7 @@ graph TD
     subgraph "Reactive Tool Discovery (MCP stdio)"
         Client -->|"3. call_tool('request_tools', query)"| MCPProxy["MCP Gateway Proxy"]
         MCPProxy <-->|"4. Semantic Search"| Catalog[("Tool Catalog (sqlite-vec)")]
-        MCPProxy -->|"5. Return Compact Acknowledgement"| Client
+        MCPProxy -->|"5. Return Schemas + Advertise via tools/list_changed"| Client
     end
     
     Client -->|"6. Next Turn: Execute Tool"| MCPProxy
@@ -172,7 +175,7 @@ sequenceDiagram
     Client->>MCP: call_tool('request_tools')
     MCP->>DB: Semantic Search
     DB-->>MCP: Top K Schemas
-    MCP-->>Client: Return Compact Acknowledgement
+    MCP-->>Client: Return Schemas + notifications/tools/list_changed
     
     note over Client,Upstream: 3. Tool Execution
     Client->>LLM: Next Turn (with Schemas)
@@ -383,7 +386,7 @@ From a clone instead, point the client at the checkout:
 }
 ```
 
-The client will see exactly two tools, `request_tools` and `batch_call`; everything else is retrieved on demand. Set `"llmProxy": { "enabled": false }` if you only ever use Mode 2 and do not want the HTTP proxy running.
+The client starts with `request_tools`, `batch_call` and whatever is in `pinnedTools`; everything else is retrieved on demand and added to the advertised list as it is found. Set `"llmProxy": { "enabled": false }` if you only ever use Mode 2 and do not want the HTTP proxy running.
 
 **OpenAI-compatible clients.** Any client that accepts a custom base URL can point at `http://127.0.0.1:4141/v1` to get Mode 1 injection.
 

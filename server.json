@@ -1,0 +1,50 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.igiamronit/justbetter-mcp",
+  "title": "JustBetter MCP",
+  "description": "An MCP gateway with dynamic, retrieval-based tool injection. Exposes two tools instead of hundreds, and retrieves the rest on demand.",
+  "repository": {
+    "url": "https://github.com/igiamronit/justbetter-mcp",
+    "source": "github"
+  },
+  "version": "0.1.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "justbetter-mcp",
+      "version": "0.1.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "valueHint": "subcommand",
+          "value": "gateway",
+          "isRequired": true,
+          "description": "Runs the Mode 2 stdio gateway. Without it the package starts its interactive TUI, which is not what an MCP client wants."
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "GEMINI_API_KEY",
+          "isRequired": false,
+          "isSecret": true,
+          "description": "Only needed for Mode 1 semantic prompt injection. Mode 2 tool discovery works without any provider key."
+        },
+        {
+          "name": "MISTRAL_API_KEY",
+          "isRequired": false,
+          "isSecret": true,
+          "description": "Alternative provider for Mode 1. Mode 2 tool discovery works without any provider key."
+        },
+        {
+          "name": "JUSTBETTER_HOME",
+          "isRequired": false,
+          "isSecret": false,
+          "description": "Overrides where config, the tool catalog and the embedding model are stored. Defaults to ~/.justbetter-mcp."
+        }
+      ]
+    }
+  ]
+}

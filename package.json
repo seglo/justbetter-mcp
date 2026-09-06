@@ -1,6 +1,7 @@
 {
   "name": "justbetter-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
+  "mcpName": "io.github.igiamronit/justbetter-mcp",
   "main": "src/proxy.ts",
   "type": "module",
   "bin": {

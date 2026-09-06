@@ -4,7 +4,9 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import path from "path";
 import { loadConfig, isPlaceholderApiKey } from "./config.js";
 import type { Config } from "./config.js";
-import { searchTools, markToolInjected } from "./catalog.js";
+import { searchTools, markToolInjected, getToolByName } from "./catalog.js";
+import type { IndexedTool } from "./catalog.js";
+import { advertiseTools, advertisedSchemas, advertisedCount, ADVERTISED_LIMIT } from "./advertised.js";
 import { embed } from "./embeddings.js";
 import { startLlmProxy } from "./llm-proxy.js";
 import { validateToolCall } from "./gates/hallucination.js";
@@ -38,7 +40,7 @@ const REQUEST_TOOLS_MCP_SCHEMA = {
 
 const BATCH_CALL_MCP_SCHEMA = {
   name: "batch_call",
-  description: "Execute multiple tools sequentially in a single turn to save time.",
+  description: "Execute one or more tools sequentially in a single turn. Accepts any tool name returned by request_tools, including tools your client has not listed yet, so this always works as a fallback when a discovered tool is not directly callable.",
   inputSchema: {
     type: "object" as const,
     properties: {
@@ -61,6 +63,18 @@ const BATCH_CALL_MCP_SCHEMA = {
 
 /** Resolves once the initial upstream connect-and-index pass has settled. */
 let upstreamsReady: Promise<void> = Promise.resolve();
+
+/**
+ * Whether the stdio client has ever asked for tools/list.
+ *
+ * This is what tells the two clients apart. Claude Desktop, Cursor and every other
+ * generic MCP client list at initialize and build the model's function list from the
+ * result. The bundled TUI never lists at all -- in Mode 1 it gets schemas from the HTTP
+ * proxy and uses stdio purely for execution. So a client that has listed is a client
+ * whose tool surface we are responsible for, and only then does advertising mean
+ * anything. Gating on it also keeps Mode 1's injection-window trust exactly as it was.
+ */
+let clientUsesToolList = false;
 
 /**
  * Executes a single tool call through the full security and dispatch pipeline.
@@ -141,14 +155,69 @@ async function main() {
 
   const server = new Server(
     { name: "justbetter-mcp", version: "1.0.0" },
-    { capabilities: { tools: {} } }
+    // listChanged is declared because the advertised set grows during a session: every
+    // request_tools that finds something new makes tools/list return more than it did a
+    // moment ago. A client that is not told the list can change has no reason to re-read it.
+    { capabilities: { tools: { listChanged: true } } }
   );
 
-  // Phase 3: tools/list returns ONLY request_tools (the fallback safety net).
-  // The LLM API Proxy handles injecting the real tool schemas dynamically.
-  // This keeps the MCP client's static tool list minimal.
+  /**
+   * Tells the client the tool list moved. Best-effort on purpose: not every client
+   * honours the notification, and the ones that do not are covered by batch_call, which
+   * is statically advertised and routes any tool name. A failure here must never take
+   * down the call that triggered it.
+   */
+  async function notifyToolListChanged(reason: string) {
+    if (!clientUsesToolList) return;
+    try {
+      await server.sendToolListChanged();
+      console.error(`[Proxy] tools/list_changed sent (${reason}); advertising ${advertisedCount()} tools.`);
+    } catch (err: any) {
+      console.error(`[Proxy] Could not send tools/list_changed: ${err?.message ?? err}`);
+    }
+  }
+
+  /**
+   * Puts the configured pinned tools on the advertised surface.
+   *
+   * Pinned tools are the deterministic floor: the ones that should be reachable without
+   * the model having to guess that a discovery step exists. Mode 1 re-injects them on
+   * every request, but over stdio nothing had ever advertised them, so a Claude Desktop
+   * session started with no file or terminal access at all.
+   *
+   * Never awaits the upstream pass -- see the note at the end of main() for why tools/list
+   * has to stay answerable on a cold start.
+   */
+  function syncPinnedAdvertisements(): string[] {
+    if (!clientUsesToolList) return [];
+    const connectedServers = activeUpstreams.map(u => u.name);
+    if (connectedServers.length === 0) return [];
+
+    const resolved: IndexedTool[] = [];
+    for (const name of config.pinnedTools) {
+      const tool = getToolByName(name, connectedServers);
+      if (!tool) continue;
+      if (!passesPreconditions(tool.tool_name, tool.server_name, config)) continue;
+      resolved.push(tool);
+    }
+    return advertiseTools(resolved, { sticky: true });
+  }
+
+  // tools/list is the whole tool surface a generic MCP client ever sees: it builds the
+  // model's function list from this and from nothing else. It starts at the two discovery
+  // primitives plus the pinned floor, and grows only by what request_tools actually found.
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return { tools: [REQUEST_TOOLS_MCP_SCHEMA, BATCH_CALL_MCP_SCHEMA] };
+    const firstList = !clientUsesToolList;
+    clientUsesToolList = true;
+    // On a cold start the client lists before indexing finishes, so this comes back empty
+    // and the post-connect pass below advertises the pinned tools with a notification.
+    syncPinnedAdvertisements();
+
+    const tools = [REQUEST_TOOLS_MCP_SCHEMA, BATCH_CALL_MCP_SCHEMA, ...advertisedSchemas()];
+    if (firstList) {
+      console.error(`[Proxy] Client uses tools/list; serving ${tools.length} tools (cap ${ADVERTISED_LIMIT} discovered).`);
+    }
+    return { tools };
   });
 
   // Phase 3: Forward tool calls to the correct upstream, with request_tools fallback
@@ -187,16 +256,30 @@ async function main() {
         };
       }
 
-      // Extract tool names and mark them as injected
-      const injectedToolNames: string[] = [];
+      // Mark as callable, and hand the client the real schemas. Marking alone was the
+      // original bug: it made the gate let the call through, but the model was never
+      // given a schema to build the call from, and the client never learned the function
+      // existed. A prose "these are now available" cannot register a tool definition.
+      const usable: IndexedTool[] = [];
       for (const r of results) {
         if (passesPreconditions(r.tool_name, r.server_name, config)) {
           markToolInjected(r.tool_name);
-          injectedToolNames.push(r.tool_name);
+          usable.push(r);
         }
       }
 
-      console.error(`[request_tools] Returning ${results.length} tools to LLM (and marking as injectable)`);
+      if (usable.length === 0) {
+        return {
+          content: [{ type: "text", text: `Found ${results.length} tools matching "${query}", but none are usable right now (their server is disconnected or a required credential is missing). Try a different capability.` }],
+        };
+      }
+
+      // Only a client that reads tools/list has a tool surface for us to grow. In Mode 1
+      // the TUI gets its schemas from the HTTP proxy, and quietly widening the gate's trust
+      // there would loosen the injection window for no benefit.
+      const newlyAdvertised = clientUsesToolList ? advertiseTools(usable) : [];
+      const toolNames = usable.map(r => r.tool_name);
+      console.error(`[request_tools] Returning ${usable.length} tools (${newlyAdvertised.length} newly advertised)`);
 
       broadcastEvent({
         type: 'discovery_trace',
@@ -206,8 +289,43 @@ async function main() {
         isFallback: true
       });
 
+      if (newlyAdvertised.length > 0) {
+        await notifyToolListChanged(`request_tools: ${newlyAdvertised.join(', ')}`);
+      }
+
+      // Mode 1 already has these schemas: the HTTP proxy injected them before the model
+      // ever saw the prompt, so a short acknowledgement is all that is needed and repeating
+      // every schema here would just pay for them twice.
+      if (!clientUsesToolList) {
+        return {
+          content: [{ type: "text", text: `Found ${usable.length} matching tool(s): ${toolNames.join(", ")}. They are available to call now.` }],
+        };
+      }
+
+      // Over stdio the schemas go in the result text as well as into tools/list. Clients
+      // differ on whether they act on tools/list_changed -- some re-read immediately, some
+      // only on restart -- and the model cannot wait for a restart. Text arrives in this
+      // turn's context unconditionally, so together with batch_call below the discovered
+      // tool is callable straight away whatever the client does about the notification.
+      const schemaBlock = usable
+        .map(r => JSON.stringify(JSON.parse(r.full_schema_json), null, 2))
+        .join('\n\n');
+
+      const example = toolNames[0];
+      const guidance = [
+        `Found ${usable.length} tool(s) for "${query}": ${toolNames.join(", ")}.`,
+        '',
+        'Schemas:',
+        schemaBlock,
+        '',
+        "These are now part of this server's tool list, so you may be able to call them directly.",
+        `If your client has not picked them up yet and ${example} is not available as a function,`,
+        'call it through batch_call instead, which accepts any tool name listed above:',
+        `  batch_call({"calls": [{"tool": "${example}", "args": { ... }}]})`
+      ].join('\n');
+
       return {
-        content: [{ type: "text", text: `Success: Found ${injectedToolNames.length} matching tools (${injectedToolNames.join(', ')}). They have been seamlessly added to your environment. You may now call them natively on the next turn.` }],
+        content: [{ type: "text", text: guidance }],
       };
     }
 
@@ -286,9 +404,19 @@ async function main() {
   // waited for it would give up and report the gateway as failed to start.
   // tools/list is static, so it can be answered immediately; request_tools awaits
   // this promise instead, which is the only handler that needs a populated catalog.
-  upstreamsReady = connectAllUpstreams(config).catch(err => {
-    console.error("[Proxy] Upstream connection failed:", err?.message ?? err);
-  });
+  upstreamsReady = connectAllUpstreams(config)
+    .catch(err => {
+      console.error("[Proxy] Upstream connection failed:", err?.message ?? err);
+    })
+    .then(async () => {
+      // The client almost always listed while this was still running, so the pinned floor
+      // was not in the catalog yet and its tools/list came back with only the two
+      // primitives. Advertise them now and tell the client the list moved.
+      const pinned = syncPinnedAdvertisements();
+      if (pinned.length > 0) {
+        await notifyToolListChanged(`pinned tools ready: ${pinned.join(', ')}`);
+      }
+    });
 }
 
 main().catch(err => {
