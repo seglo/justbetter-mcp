@@ -52,15 +52,26 @@ export const ConfigSchema = z.object({
   upstreamServers: z.array(
     z.object({
       name: z.string(),
-      command: z.string(),
+      command: z.string().optional(),
       args: z.array(z.string()).default([]),
       env: z.record(z.string(), z.string()).optional(),
       // Working directory for the spawned server. Defaults to the gateway's package
       // root so relative args (e.g. "src/terminal-server.ts") resolve against the
       // installation rather than whatever directory the MCP client launched us from.
       cwd: z.string().optional(),
-    })
+      url: z.string().optional(),
+      headers: z.record(z.string(), z.string()).optional(),
+    }).refine(
+      // XOR clamp for backwards-compatibility with existing configs that lack a
+      // "type" discriminator. A discriminatedUnion would be cleaner but would
+      // break every config.json in the wild.
+      (s) => (!!s.command && !s.url) || (!s.command && !!s.url),
+      { message: "Exactly one of 'command' (stdio) or 'url' (HTTP/SSE) must be provided" }
+    )
   ),
+  // Per-connect timeout for HTTP/SSE upstream servers (ms). Stdio spawns are
+  // near-instant so this gate does not apply to them.
+  upstreamConnectionTimeoutMs: z.number().positive().default(20_000),
   llmProxy: LlmProxySchema.optional(),
   dashboard: DashboardSchema.optional(),
   pinnedTools: z.array(z.string()).default([]),

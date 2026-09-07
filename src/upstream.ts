@@ -1,5 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { Config } from "./config.js";
 import { resolveServerEnv, UpstreamServerSchema } from "./config.js";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
@@ -87,10 +89,60 @@ function unresolvedSecrets(env?: Record<string, string>): string[] {
   return missing;
 }
 
-export async function connectSingleUpstream(rawServerConfig: any, allowedDirectories: string[] = []): Promise<void> {
-  // Validate before spawning. This function turns config into a child process, so it
-  // is the last place to reject a malformed (or attacker-supplied) server entry.
+export async function connectSingleUpstream(rawServerConfig: any, allowedDirectories: string[] = [], connectionTimeoutMs: number = 20_000): Promise<void> {
+  // Validate before spawning or dialing. This function turns config into a live
+  // connection, so it is the last place to reject a malformed (or attacker-supplied)
+  // server entry.
   const serverConfig = UpstreamServerSchema.parse(rawServerConfig);
+
+  if (serverConfig.url) {
+    const headers: Record<string, string> = { ...(serverConfig.headers ?? {}) };
+    console.error(`Connecting to upstream HTTP server: ${serverConfig.name} (${serverConfig.url})...`);
+
+    try {
+      const transport = new StreamableHTTPClientTransport(
+        new URL(serverConfig.url),
+        { requestInit: { headers } }
+      );
+
+      const client = new Client(
+        { name: "justbetter-mcp-gateway", version: "1.0.0" },
+        { capabilities: {} }
+      );
+
+      const timeoutHandle = setTimeout(() => {
+        client.close().catch(() => {});
+      }, connectionTimeoutMs);
+
+      try {
+        await Promise.race([
+          client.connect(transport as Transport),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`connection timed out after ${connectionTimeoutMs}ms`)), connectionTimeoutMs)
+          )
+        ]);
+      } finally {
+        clearTimeout(timeoutHandle);
+      }
+
+      const toolsResponse = await client.listTools();
+
+      activeUpstreams.push({
+        name: serverConfig.name,
+        client,
+        tools: toolsResponse.tools,
+      });
+
+      serverStatuses[serverConfig.name] = 'connected';
+      console.error(`Connected to ${serverConfig.name} - found ${toolsResponse.tools.length} tools.`);
+
+      await indexTools(serverConfig.name, toolsResponse.tools);
+    } catch (error: any) {
+      console.error(`\n⚠️ Failed to connect to HTTP server '${serverConfig.name}': ${error.message}`);
+      serverStatuses[serverConfig.name] = 'failed';
+    }
+    return;
+  }
 
   // Checked before spawning: an unusable server costs a process, an index pass, and a
   // catalog entry, and the precondition gate hides its tools anyway once it is not
@@ -113,11 +165,23 @@ export async function connectSingleUpstream(rawServerConfig: any, allowedDirecto
     // src/terminal-server.ts") only starts when the gateway happens to have been
     // launched from the repo — so those servers vanish under Claude Desktop or Cursor.
     const transport = new StdioClientTransport({
-      command: normaliseCommand(serverConfig.command),
+      command: normaliseCommand(serverConfig.command!),
       args: resolveServerArgs(serverConfig.args, allowedDirectories),
       cwd: serverConfig.cwd ?? os.tmpdir(),
+      stderr: 'pipe',
       env: { ...process.env, ...(resolveServerEnv(serverConfig.env) || {}) } as Record<string, string>,
     });
+
+    // Capture the child's stderr so it does not leak to the parent terminal
+    // (the default 'inherit' would send it straight to opencode's display).
+    const childStderr = transport.stderr;
+    if (childStderr) {
+      childStderr.on('data', (chunk: Buffer) => {
+        for (const line of chunk.toString().split('\n')) {
+          if (line.trim()) console.error(`[${serverConfig.name}] ${line.trim()}`);
+        }
+      });
+    }
 
     const client = new Client(
       { name: "justbetter-mcp-gateway", version: "1.0.0" },
@@ -149,10 +213,11 @@ export async function connectSingleUpstream(rawServerConfig: any, allowedDirecto
 
 export async function connectAllUpstreams(config: Config): Promise<void> {
   const allowed = config.allowedDirectories ?? [];
+  const timeout = config.upstreamConnectionTimeoutMs ?? 20_000;
   // Worth printing: when a file tool refuses a path, this is the line that explains it.
   console.error(`[Upstream Manager] Agent workspace: ${(allowed.length > 0 ? allowed : [invocationCwd()]).join(", ")}`);
   for (const serverConfig of config.upstreamServers) {
-    await connectSingleUpstream(serverConfig, allowed);
+    await connectSingleUpstream(serverConfig, allowed, timeout);
   }
 }
 

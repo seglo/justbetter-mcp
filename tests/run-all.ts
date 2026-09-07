@@ -128,6 +128,49 @@ const tests: TestCase[] = [
     }
   },
   {
+    name: 'config: upstream server with url is valid, with headers is valid, with neither command nor url is rejected, with both is rejected',
+    async fn() {
+      const { loadConfig } = await import(srcModule('src/config.ts'));
+
+      const validHttpPath = tempFile('config-http-valid.json');
+      writeJson(validHttpPath, {
+        upstreamServers: [{ name: 'http-upstream', url: 'https://example.com/mcp' }]
+      });
+      const httpConfig = loadConfig(validHttpPath);
+      assert.equal(httpConfig.upstreamServers[0]?.url, 'https://example.com/mcp');
+      assert.equal(httpConfig.upstreamServers[0]?.command, undefined);
+
+      const validHttpHeadersPath = tempFile('config-http-headers.json');
+      writeJson(validHttpHeadersPath, {
+        upstreamServers: [{ name: 'http-with-headers', url: 'https://example.com/mcp', headers: { 'X-Custom': 'value' } }]
+      });
+      const headersConfig = loadConfig(validHttpHeadersPath);
+      assert.equal(headersConfig.upstreamServers[0]?.headers?.['X-Custom'], 'value');
+
+      const stdioPath = tempFile('config-stdio-valid.json');
+      writeJson(stdioPath, {
+        upstreamServers: [{ name: 'stdio-upstream', command: 'node', args: ['server.js'] }]
+      });
+      const stdioConfig = loadConfig(stdioPath);
+      assert.equal(stdioConfig.upstreamServers[0]?.command, 'node');
+      assert.equal(stdioConfig.upstreamServers[0]?.url, undefined);
+
+      // XOR: neither command nor url → reject
+      const neitherPath = tempFile('config-neither.json');
+      writeJson(neitherPath, {
+        upstreamServers: [{ name: 'orphan-upstream' }]
+      });
+      await expectRejects(() => loadConfig(neitherPath));
+
+      // XOR: both command and url → reject
+      const bothPath = tempFile('config-both.json');
+      writeJson(bothPath, {
+        upstreamServers: [{ name: 'both-upstream', command: 'node', url: 'https://example.com/mcp' }]
+      });
+      await expectRejects(() => loadConfig(bothPath));
+    }
+  },
+  {
     name: 'grouping: current seam is passthrough',
     async fn() {
       const { resolveGroupedCall } = await import(srcModule('src/grouping.ts'));
@@ -744,6 +787,43 @@ const tests: TestCase[] = [
       });
       assert.equal(serverStatuses['has-a-token'], 'failed', 'it should have been attempted, and failed to spawn');
       delete process.env[ABSENT];
+    }
+  },
+  {
+    name: 'upstream: HTTP connection timing out is caught and reported, not hung',
+    async fn() {
+      const { connectSingleUpstream, serverStatuses } = await import(srcModule('src/upstream.ts'));
+      const { createServer } = await import('node:http');
+
+      // A server that accepts the TCP handshake but never sends a response
+      // exercises the AbortController timeout path — the OS never aborts a
+      // connected-but-stalling socket on its own.
+      const server = createServer((_req, res) => {
+        // Stall: write headers then go to sleep. The gateway will time out on
+        // the SSE connection or on the initialize POST.
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        // never call res.end()
+      });
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      const addr = server.address();
+      const port = typeof addr === 'object' && addr ? addr.port : null;
+      if (!port) throw new Error('failed to bind test server');
+
+      try {
+        const shortTimeoutMs = 2_000;
+        const start = Date.now();
+        await connectSingleUpstream(
+          { name: 'stall-server', url: `http://127.0.0.1:${port}/mcp` },
+          [],
+          shortTimeoutMs
+        );
+        const elapsed = Date.now() - start;
+        assert.ok(elapsed < 7_000, `timeout should fire in under 7s, took ${elapsed}ms`);
+        assert.equal(serverStatuses['stall-server'], 'failed');
+      } finally {
+        server.close();
+        delete serverStatuses['stall-server'];
+      }
     }
   },
   {
